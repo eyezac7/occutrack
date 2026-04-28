@@ -61,50 +61,62 @@ function pctLabel(count, cap) {
 }
 
 // ─── CSV Parser ───────────────────────────────────────────────────────────────
-// days_off uses comma as a separator (e.g. "Sat,Sun") which conflicts with CSV
-// comma splitting. We resolve this by knowing the fixed column positions of the
-// required fields and collecting any extra tokens between shift_end and the next
-// known optional column back into days_off.
+// Handles Excel-quoted fields ("Sat,Sun") and unquoted multi-day fields (Sat,Sun)
 const VALID_DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+// Proper RFC-4180 CSV row parser — correctly handles quoted fields from Excel
+function parseCSVRow(line) {
+  const fields = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (ch === "," && !inQuotes) {
+      fields.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  fields.push(current.trim());
+  return fields;
+}
 
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return { error: "File is empty or has no data rows." };
-  const headers = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/\s+/g, "_"));
+
+  const headers = parseCSVRow(lines[0]).map(h => h.toLowerCase().replace(/\s+/g, "_"));
   const required = ["employee_id","full_name","room_id","shift_start","shift_end","days_off"];
   const missing = required.filter(r => !headers.includes(r));
   if (missing.length) return { error: `Missing required columns: ${missing.join(", ")}` };
 
-  // Find the index of days_off in the header — everything after shift_end and
-  // before the next non-day column gets merged back into days_off.
   const daysOffIdx = headers.indexOf("days_off");
-  // Optional columns that come AFTER days_off (if present)
-  const afterDaysOff = ["department","employment_type","site_id"].filter(c => headers.includes(c));
-
   const workers = [], errors = [];
 
   for (let i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
-    const raw = lines[i].split(",").map(v => v.trim());
-
-    // Rebuild vals: for each header position, collect the value.
-    // If we're at the days_off column, consume all tokens that look like day
-    // names (Mon/Tue/Wed/Thu/Fri/Sat/Sun) and join them back with commas.
+    const raw = parseCSVRow(lines[i]);
     const row = {};
     let rawIdx = 0;
 
     for (let h = 0; h < headers.length; h++) {
-      if (headers[h] === "days_off") {
-        // Collect all consecutive day-name tokens
-        const dayTokens = [];
-        while (
-          rawIdx < raw.length &&
-          VALID_DAYS.includes(raw[rawIdx])
-        ) {
-          dayTokens.push(raw[rawIdx]);
+      if (h === daysOffIdx) {
+        // The field may already be merged by Excel quoting: "Sat,Sun" -> "Sat,Sun"
+        // OR it may be split across raw tokens: Sat | Sun
+        const firstVal = raw[rawIdx] || "";
+        rawIdx++;
+        // Split in case Excel already merged them with commas inside quotes
+        const dayParts = firstVal.split(",").map(d => d.trim()).filter(d => VALID_DAYS.includes(d));
+        // Also consume any following tokens that are plain day names (unquoted split)
+        while (rawIdx < raw.length && VALID_DAYS.includes(raw[rawIdx])) {
+          dayParts.push(raw[rawIdx]);
           rawIdx++;
         }
-        row["days_off"] = dayTokens.join(",");
+        row["days_off"] = dayParts.join(",");
       } else {
         row[headers[h]] = raw[rawIdx] || "";
         rawIdx++;
@@ -113,10 +125,11 @@ function parseCSV(text) {
 
     if (!row.employee_id) { errors.push(`Row ${i+1}: missing employee_id`); continue; }
     if (!row.shift_start?.match(/^\d{1,2}:\d{2}$/) || !row.shift_end?.match(/^\d{1,2}:\d{2}$/)) {
-      errors.push(`Row ${i+1}: invalid time format (use HH:MM)`); continue;
+      errors.push(`Row ${i+1}: invalid shift time — use HH:MM e.g. 08:00`); continue;
     }
-    if (!row.days_off) { errors.push(`Row ${i+1}: no valid days_off found — use Mon Tue Wed Thu Fri Sat Sun`); continue; }
-
+    if (!row.days_off) {
+      errors.push(`Row ${i+1}: no valid days_off — use day names e.g. Sat,Sun`); continue;
+    }
     workers.push(row);
   }
   return { workers, errors };
