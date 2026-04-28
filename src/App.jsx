@@ -61,6 +61,12 @@ function pctLabel(count, cap) {
 }
 
 // ─── CSV Parser ───────────────────────────────────────────────────────────────
+// days_off uses comma as a separator (e.g. "Sat,Sun") which conflicts with CSV
+// comma splitting. We resolve this by knowing the fixed column positions of the
+// required fields and collecting any extra tokens between shift_end and the next
+// known optional column back into days_off.
+const VALID_DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return { error: "File is empty or has no data rows." };
@@ -68,17 +74,49 @@ function parseCSV(text) {
   const required = ["employee_id","full_name","room_id","shift_start","shift_end","days_off"];
   const missing = required.filter(r => !headers.includes(r));
   if (missing.length) return { error: `Missing required columns: ${missing.join(", ")}` };
+
+  // Find the index of days_off in the header — everything after shift_end and
+  // before the next non-day column gets merged back into days_off.
+  const daysOffIdx = headers.indexOf("days_off");
+  // Optional columns that come AFTER days_off (if present)
+  const afterDaysOff = ["department","employment_type","site_id"].filter(c => headers.includes(c));
+
   const workers = [], errors = [];
+
   for (let i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
-    const vals = lines[i].split(",").map(v => v.trim());
-    if (vals.length < required.length) { errors.push(`Row ${i+1}: too few columns`); continue; }
+    const raw = lines[i].split(",").map(v => v.trim());
+
+    // Rebuild vals: for each header position, collect the value.
+    // If we're at the days_off column, consume all tokens that look like day
+    // names (Mon/Tue/Wed/Thu/Fri/Sat/Sun) and join them back with commas.
     const row = {};
-    headers.forEach((h, idx) => { row[h] = vals[idx] || ""; });
+    let rawIdx = 0;
+
+    for (let h = 0; h < headers.length; h++) {
+      if (headers[h] === "days_off") {
+        // Collect all consecutive day-name tokens
+        const dayTokens = [];
+        while (
+          rawIdx < raw.length &&
+          VALID_DAYS.includes(raw[rawIdx])
+        ) {
+          dayTokens.push(raw[rawIdx]);
+          rawIdx++;
+        }
+        row["days_off"] = dayTokens.join(",");
+      } else {
+        row[headers[h]] = raw[rawIdx] || "";
+        rawIdx++;
+      }
+    }
+
     if (!row.employee_id) { errors.push(`Row ${i+1}: missing employee_id`); continue; }
-    if (!row.shift_start.match(/^\d{1,2}:\d{2}$/) || !row.shift_end.match(/^\d{1,2}:\d{2}$/)) {
+    if (!row.shift_start?.match(/^\d{1,2}:\d{2}$/) || !row.shift_end?.match(/^\d{1,2}:\d{2}$/)) {
       errors.push(`Row ${i+1}: invalid time format (use HH:MM)`); continue;
     }
+    if (!row.days_off) { errors.push(`Row ${i+1}: no valid days_off found — use Mon Tue Wed Thu Fri Sat Sun`); continue; }
+
     workers.push(row);
   }
   return { workers, errors };
